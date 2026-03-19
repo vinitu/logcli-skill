@@ -1,0 +1,418 @@
+name: CI · PR Auto-merge · Release
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ci-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint Shell & Docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate repository structure
+        run: |
+          set -euo pipefail
+          required=(
+            AGENTS.md
+            LICENSE
+            README.md
+            SKILL.md
+            scripts/logcli.sh
+            scripts/_lib/common.sh
+            references/logql-cheatsheet.md
+          )
+          for path in "${required[@]}"; do
+            [ -f "$path" ] || { echo "::error file=$path::Missing required file"; exit 1; }
+          done
+
+      - name: Ensure secrets file is not tracked
+        run: |
+          set -euo pipefail
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error file=.env::.env must stay untracked"
+            exit 1
+          fi
+
+      - name: Shellcheck scripts
+        run: |
+          shellcheck scripts/logcli.sh scripts/_lib/common.sh
+
+      - name: Smoke-check help output
+        run: bash scripts/logcli.sh --help >/dev/null
+
+      - name: Run unit tests
+        run: |
+          bash tests/test_cli_help.sh
+          bash tests/test_env_resolution.sh
+          bash tests/test_chunking.sh
+          bash tests/test_json_output.sh
+
+      - name: Validate SKILL.md frontmatter
+        run: |
+          set -euo pipefail
+          if ! head -1 SKILL.md | grep -q '^---'; then
+            echo "::error::SKILL.md must start with YAML frontmatter (---)"
+            exit 1
+          fi
+          if ! grep -q '^name:' SKILL.md; then
+            echo "::error::SKILL.md frontmatter must contain 'name:' field"
+            exit 1
+          fi
+          if ! grep -q '^description:' SKILL.md; then
+            echo "::error::SKILL.md frontmatter must contain 'description:' field"
+            exit 1
+          fi
+          echo "SKILL.md frontmatter is valid"
+
+  determine_version:
+    name: Detect version bump
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    outputs:
+      version-bump: ${{ steps.detect.outputs.version_bump }}
+      matching_pr: ${{ steps.detect.outputs.matching_pr }}
+    steps:
+      - name: Detect version bump type
+        id: detect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PULL_REQUESTS_INPUT: ${{ toJson(github.event.pull_request) }}
+        run: |
+          set -euo pipefail
+
+          normalize_list() {
+            tr ',' '\n' <<<"$1" | sed 's/^\s*//;s/\s*$//' | sed '/^$/d'
+          }
+
+          matches_prefix() {
+            local prefixes="$1"
+            local branch="$2"
+            while IFS= read -r prefix; do
+              if [[ -n "$prefix" && "$branch" == "$prefix"* ]]; then
+                return 0
+              fi
+            done <<<"$prefixes"
+            return 1
+          }
+
+          bump="patch"
+          matching_pr="false"
+          prs_input="${PULL_REQUESTS_INPUT:-}"
+
+          prs=""
+          if [ -n "$prs_input" ]; then
+            prs=$(jq -c 'if type=="array" then .[] else . end' <<<"$prs_input" 2>/dev/null || true)
+          fi
+
+          if [ -z "$prs" ]; then
+            echo "No pull requests found. Defaulting to $bump bump."
+            echo "version_bump=$bump" >> "$GITHUB_OUTPUT"
+            echo "matching_pr=$matching_pr" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          major_prefixes=$(normalize_list "major/")
+          minor_prefixes=$(normalize_list "feature/,features/")
+          patch_prefixes=$(normalize_list "fix/,fixes/")
+
+          while IFS= read -r pr; do
+            number=$(jq -r '.number' <<<"$pr")
+            head=$(jq -r '.head.ref' <<<"$pr")
+            base=$(jq -r '.base.ref' <<<"$pr")
+
+            if [ "$base" != "main" ]; then
+              echo "Skipping PR #$number because base branch is $base (target main)."
+              continue
+            fi
+
+            matching_pr="true"
+
+            if matches_prefix "$major_prefixes" "$head"; then
+              bump="major"
+              break
+            fi
+
+            if [ "$bump" != "major" ] && matches_prefix "$minor_prefixes" "$head"; then
+              bump="minor"
+              continue
+            fi
+
+            if [ "$bump" != "major" ] && [ "$bump" != "minor" ] && matches_prefix "$patch_prefixes" "$head"; then
+              bump="patch"
+            fi
+          done <<<"$prs"
+
+          echo "Selected version bump: $bump"
+          echo "version_bump=$bump" >> "$GITHUB_OUTPUT"
+          echo "matching_pr=$matching_pr" >> "$GITHUB_OUTPUT"
+
+  merge_prs:
+    name: Auto-merge PRs
+    needs:
+      - lint
+      - determine_version
+    if: ${{ needs.determine_version.result == 'success' && needs.determine_version.outputs.matching_pr == 'true' && needs.lint.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      merged: ${{ steps.merge.outputs.merged }}
+      merged-prs: ${{ steps.merge.outputs.merged_prs }}
+    steps:
+      - name: Merge pull requests
+        id: merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_REPO: ${{ github.repository }}
+          PULL_REQUESTS_INPUT: ${{ toJson(github.event.pull_request) }}
+        run: |
+          set -euo pipefail
+
+          merged_any="false"
+          merged_entries=()
+          prs_input="${PULL_REQUESTS_INPUT:-}"
+          PRS=""
+
+          if [ -n "$prs_input" ]; then
+            PRS=$(jq -c 'if type=="array" then .[] else . end' <<<"$prs_input" 2>/dev/null || true)
+          fi
+
+          if [ -z "$PRS" ]; then
+            echo "No pull requests found."
+          fi
+
+          while IFS= read -r pr; do
+            [ -z "$pr" ] && continue
+            number=$(jq -r '.number' <<<"$pr")
+            base=$(jq -r '.base.ref' <<<"$pr")
+            head=$(jq -r '.head.ref' <<<"$pr")
+            head_repo=$(jq -r '.head.repo.full_name // ""' <<<"$pr")
+            head_lower="${head,,}"
+
+            if [ "$base" != "main" ]; then
+              echo "Skipping PR #$number because base branch is $base."
+              continue
+            fi
+
+            if [ -n "$head_repo" ] && [ "$head_repo" != "$BASE_REPO" ]; then
+              echo "Skipping PR #$number because it originates from fork $head_repo."
+              continue
+            fi
+
+            state=$(gh pr view "$number" -R "$REPO" --json state --jq '.state')
+            if [ "$state" != "OPEN" ]; then
+              echo "PR #$number is $state; nothing to merge."
+              continue
+            fi
+
+            is_draft=$(gh pr view "$number" -R "$REPO" --json isDraft --jq '.isDraft')
+            if [ "$is_draft" = "true" ]; then
+              echo "Skipping PR #$number because it is a draft."
+              continue
+            fi
+
+            if [[ "$head_lower" == wip* || "$head_lower" == */wip* ]]; then
+              echo "Skipping PR #$number because head branch is marked WIP ($head)."
+              continue
+            fi
+
+            pr_meta=$(gh pr view "$number" -R "$REPO" --json title,author --jq '.title + "::" + (.author.login // "")' 2>/dev/null || echo "")
+            title="${pr_meta%%::*}"
+            author="${pr_meta##*::}"
+            [ -z "$title" ] || [ "$title" = "null" ] && title="Pull request #${number}"
+            [ -z "$author" ] || [ "$author" = "null" ] && author="${GITHUB_ACTOR:-bot}"
+
+            echo "Merging PR #$number with squash..."
+            gh pr merge "$number" -R "$REPO" --squash --delete-branch --body "Merged automatically after successful CI."
+
+            merged_any="true"
+            entry=$(jq -n --arg number "$number" --arg head "$head" --arg title "$title" --arg author "$author" '{number:$number,head:$head,title:$title,author:$author}')
+            merged_entries+=("$entry")
+          done <<<"$PRS"
+
+          if [ "$merged_any" = "true" ]; then
+            merged_json=$(printf '%s\n' "${merged_entries[@]}" | jq -s '.')
+          else
+            merged_json='[]'
+          fi
+
+          {
+            echo "merged=$merged_any"
+            echo "merged_prs<<EOF"
+            printf '%s\n' "$merged_json"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  calculate_tag:
+    name: Compute next tag
+    needs:
+      - determine_version
+      - merge_prs
+    if: ${{ needs.determine_version.result == 'success' && needs.merge_prs.result == 'success' && needs.merge_prs.outputs.merged == 'true' }}
+    runs-on: ubuntu-latest
+    outputs:
+      new-tag: ${{ steps.compute.outputs.new_tag }}
+      previous-tag: ${{ steps.compute.outputs.previous_tag }}
+    steps:
+      - name: Check out repository with tags
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Compute next tag
+        id: compute
+        env:
+          VERSION_BUMP: ${{ needs.determine_version.outputs.version-bump }}
+        run: |
+          set -euo pipefail
+
+          version_bump="${VERSION_BUMP,,}"
+          case "$version_bump" in
+            major|minor|patch) ;;
+            *) echo "Unsupported bump '$version_bump'." >&2; exit 1 ;;
+          esac
+
+          git fetch --tags
+          latest_tag=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n1)
+          [ -z "$latest_tag" ] && latest_tag="v0.0.0"
+
+          version="${latest_tag#v}"
+          IFS='.' read -r major minor patch <<<"$version"
+
+          case "$version_bump" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+
+          new_tag="v${major}.${minor}.${patch}"
+          {
+            echo "new_tag=$new_tag"
+            echo "previous_tag=$latest_tag"
+          } >> "$GITHUB_OUTPUT"
+
+  create_tag:
+    name: Create git tag
+    needs:
+      - merge_prs
+      - calculate_tag
+    if: ${{ needs.merge_prs.outputs.merged == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      new-tag: ${{ steps.create.outputs.new_tag }}
+      previous-tag: ${{ steps.create.outputs.previous_tag }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Create and push tag
+        id: create
+        env:
+          NEXT_TAG: ${{ needs.calculate_tag.outputs.new-tag }}
+          PREVIOUS_TAG: ${{ needs.calculate_tag.outputs.previous-tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main --tags
+          git checkout main
+          git pull origin main
+
+          echo "Creating tag $NEXT_TAG (previous $PREVIOUS_TAG)"
+          git tag -a "$NEXT_TAG" -m "Automated release $NEXT_TAG"
+          git push origin "$NEXT_TAG"
+
+          {
+            echo "new_tag=$NEXT_TAG"
+            echo "previous_tag=$PREVIOUS_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+  create_release:
+    name: Publish release
+    needs:
+      - merge_prs
+      - create_tag
+    if: ${{ needs.create_tag.result == 'success' && needs.merge_prs.outputs.merged == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.create_tag.outputs.new-tag }}
+          PREVIOUS_TAG: ${{ needs.create_tag.outputs.previous-tag }}
+          MERGED_PRS: ${{ needs.merge_prs.outputs.merged-prs }}
+        run: |
+          set -euo pipefail
+          tmp_notes="$(mktemp)"
+          trap 'rm -f "$tmp_notes"' EXIT
+
+          tag="${TAG_NAME:-}"
+          previous_tag="${PREVIOUS_TAG:-}"
+          merged_json="${MERGED_PRS:-[]}"
+          [ -z "$merged_json" ] && merged_json='[]'
+
+          if [ "$merged_json" = "[]" ]; then
+            echo "No merged PRs provided; collecting between ${previous_tag}...${tag}"
+            if [ -n "$previous_tag" ]; then
+              merged_entries=()
+              commit_messages=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${previous_tag}...${tag}" --jq '.commits[].commit.message' 2>/dev/null || true)
+              pr_numbers=$(grep -oE '#[0-9]+' <<<"$commit_messages" | tr -d '#' | sort -u || true)
+              for pr_number in $pr_numbers; do
+                pr_json=$(gh pr view "$pr_number" -R "$GITHUB_REPOSITORY" --json number,title,author --jq '{number:.number,title:.title,author:(.author.login // "bot")}' 2>/dev/null || true)
+                [ -n "$pr_json" ] && merged_entries+=("$pr_json")
+              done
+              if [ "${#merged_entries[@]}" -gt 0 ]; then
+                merged_json=$(printf '%s\n' "${merged_entries[@]}" | jq -s 'unique_by(.number)')
+              fi
+            fi
+          fi
+
+          changes=$(jq -r --arg repo "$GITHUB_REPOSITORY" '
+            if length == 0 then "" else
+              map("- " + (.title // ("Pull request #" + .number)) + " by @" + ((.author // "bot")) +
+                  " in [#" + .number + "](https://github.com/" + $repo + "/pull/" + .number + ")")
+              | .[]
+            end' <<<"$merged_json" || true)
+
+          {
+            echo "## What's Changed"
+            if [ -n "$changes" ]; then
+              printf "%s\n" "$changes"
+            else
+              echo "- No pull requests were merged in this release."
+            fi
+            if [ -n "$previous_tag" ]; then
+              echo
+              echo "**Full Changelog:** [${previous_tag}...${tag}](https://github.com/${GITHUB_REPOSITORY}/compare/${previous_tag}...${tag})"
+            fi
+          } >"$tmp_notes"
+
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" --title "$tag" --notes-file "$tmp_notes"

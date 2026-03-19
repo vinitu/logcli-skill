@@ -1,0 +1,226 @@
+name: CI · Main Push · Patch Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ci-main-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint Shell & Docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate repository structure
+        run: |
+          set -euo pipefail
+          required=(
+            AGENTS.md
+            LICENSE
+            README.md
+            SKILL.md
+            scripts/logcli.sh
+            scripts/_lib/common.sh
+            references/logql-cheatsheet.md
+          )
+          for path in "${required[@]}"; do
+            [ -f "$path" ] || { echo "::error file=$path::Missing required file"; exit 1; }
+          done
+
+      - name: Ensure secrets file is not tracked
+        run: |
+          set -euo pipefail
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error file=.env::.env must stay untracked"
+            exit 1
+          fi
+
+      - name: Shellcheck scripts
+        run: |
+          shellcheck scripts/logcli.sh scripts/_lib/common.sh
+
+      - name: Smoke-check help output
+        run: bash scripts/logcli.sh --help >/dev/null
+
+      - name: Run unit tests
+        run: |
+          bash tests/test_cli_help.sh
+          bash tests/test_env_resolution.sh
+          bash tests/test_chunking.sh
+          bash tests/test_json_output.sh
+
+      - name: Validate SKILL.md frontmatter
+        run: |
+          set -euo pipefail
+          if ! head -1 SKILL.md | grep -q '^---'; then
+            echo "::error::SKILL.md must start with YAML frontmatter (---)"
+            exit 1
+          fi
+          if ! grep -q '^name:' SKILL.md; then
+            echo "::error::SKILL.md frontmatter must contain 'name:' field"
+            exit 1
+          fi
+          if ! grep -q '^description:' SKILL.md; then
+            echo "::error::SKILL.md frontmatter must contain 'description:' field"
+            exit 1
+          fi
+          echo "SKILL.md frontmatter is valid"
+
+  calculate_tag:
+    name: Compute next tag
+    needs:
+      - lint
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      github.actor != 'github-actions[bot]' &&
+      needs.lint.result == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      new-tag: ${{ steps.compute.outputs.new_tag }}
+      previous-tag: ${{ steps.compute.outputs.previous_tag }}
+    steps:
+      - name: Check out repository with tags
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Compute next tag
+        id: compute
+        run: |
+          set -euo pipefail
+          git fetch --tags
+          latest_tag=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n1)
+          [ -z "$latest_tag" ] && latest_tag="v0.0.0"
+
+          version="${latest_tag#v}"
+          IFS='.' read -r major minor patch <<<"$version"
+          patch=$((patch + 1))
+
+          new_tag="v${major}.${minor}.${patch}"
+          {
+            echo "new_tag=$new_tag"
+            echo "previous_tag=$latest_tag"
+          } >> "$GITHUB_OUTPUT"
+
+  create_tag:
+    name: Create git tag
+    needs:
+      - lint
+      - calculate_tag
+    if: ${{ needs.calculate_tag.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      new-tag: ${{ steps.create.outputs.new_tag }}
+      previous-tag: ${{ steps.create.outputs.previous_tag }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Create and push tag
+        id: create
+        env:
+          NEXT_TAG: ${{ needs.calculate_tag.outputs.new-tag }}
+          PREVIOUS_TAG: ${{ needs.calculate_tag.outputs.previous-tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main --tags
+          git checkout main
+          git pull origin main
+
+          echo "Creating tag $NEXT_TAG (previous $PREVIOUS_TAG)"
+          git tag -a "$NEXT_TAG" -m "Automated release $NEXT_TAG"
+          git push origin "$NEXT_TAG"
+
+          {
+            echo "new_tag=$NEXT_TAG"
+            echo "previous_tag=$PREVIOUS_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+  create_release:
+    name: Publish release
+    needs:
+      - create_tag
+    if: ${{ needs.create_tag.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.create_tag.outputs.new-tag }}
+          PREVIOUS_TAG: ${{ needs.create_tag.outputs.previous-tag }}
+        run: |
+          set -euo pipefail
+          tmp_notes="$(mktemp)"
+          trap 'rm -f "$tmp_notes"' EXIT
+
+          tag="${TAG_NAME:-}"
+          previous_tag="${PREVIOUS_TAG:-}"
+
+          merged_entries=()
+          commit_messages=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${previous_tag}...${tag}" --jq '.commits[].commit.message' 2>/dev/null || true)
+          pr_numbers=$(grep -oE '#[0-9]+' <<<"$commit_messages" | tr -d '#' | sort -u || true)
+          for pr_number in $pr_numbers; do
+            pr_json=$(gh pr view "$pr_number" -R "$GITHUB_REPOSITORY" --json number,title,author --jq '{number:.number,title:.title,author:(.author.login // "bot")}' 2>/dev/null || true)
+            [ -n "$pr_json" ] && merged_entries+=("$pr_json")
+          done
+
+          if [ "${#merged_entries[@]}" -eq 0 ]; then
+            commit_shas=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${previous_tag}...${tag}" --jq '.commits[].sha' 2>/dev/null || true)
+            for sha in $commit_shas; do
+              pr_json_list=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/pulls" --jq '.[] | {number:.number,title:.title,author:(.user.login // "bot")}' 2>/dev/null || true)
+              if [ -n "$pr_json_list" ]; then
+                while IFS= read -r pr_line; do
+                  merged_entries+=("$pr_line")
+                done <<<"$pr_json_list"
+              fi
+            done
+          fi
+
+          if [ "${#merged_entries[@]}" -gt 0 ]; then
+            merged_json=$(printf '%s\n' "${merged_entries[@]}" | jq -s 'unique_by(.number)')
+          else
+            merged_json='[]'
+          fi
+
+          changes=$(jq -r --arg repo "$GITHUB_REPOSITORY" '
+            if length == 0 then "" else
+              map("- " + (.title // ("Pull request #" + .number)) + " by @" + ((.author // "bot")) +
+                  " in [#" + .number + "](https://github.com/" + $repo + "/pull/" + .number + ")")
+              | .[]
+            end' <<<"$merged_json" || true)
+
+          {
+            echo "## What's Changed"
+            if [ -n "$changes" ]; then
+              printf "%s\n" "$changes"
+            else
+              echo "- Direct push to main."
+            fi
+            if [ -n "$previous_tag" ]; then
+              echo
+              echo "**Full Changelog:** [${previous_tag}...${tag}](https://github.com/${GITHUB_REPOSITORY}/compare/${previous_tag}...${tag})"
+            fi
+          } >"$tmp_notes"
+
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" --title "$tag" --notes-file "$tmp_notes"
