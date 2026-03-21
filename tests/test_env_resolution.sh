@@ -5,6 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMMON="$SCRIPT_DIR/../scripts/_lib/common.sh"
+BASH_BIN="$(command -v bash)"
 PASS=0
 FAIL=0
 
@@ -35,64 +36,77 @@ assert_fail() {
 
 echo "=== test_env_resolution.sh ==="
 
-# Source common in a subshell to avoid polluting current shell
 echo "--- URL resolution ---"
 
-# dev environment
-result="$(bash -c "source '$COMMON'; resolve_loki_url dev")" && rc=0 || rc=$?
-assert_eq "dev resolves to correct URL" "https://loki-dev.example.invalid" "$result"
+result="$(LOKI_URL=https://loki.example.test bash -c "source '$COMMON'; resolve_loki_url")" && rc=0 || rc=$?
+assert_eq "LOKI_URL resolves from env" "https://loki.example.test" "$result"
 
-# rc environment
-result="$(bash -c "source '$COMMON'; resolve_loki_url rc")" && rc=0 || rc=$?
-assert_eq "rc resolves to correct URL" "https://loki-rc.example.invalid" "$result"
-
-# prod environment
-result="$(bash -c "source '$COMMON'; resolve_loki_url prod")" && rc=0 || rc=$?
-assert_eq "prod resolves to correct URL" "https://loki-prod.example.invalid" "$result"
-
-# unknown environment
-result="$(bash -c "source '$COMMON'; resolve_loki_url unknown" 2>/dev/null)" && rc=0 || rc=$?
-assert_fail "unknown env returns error" "$rc"
+result="$(bash -c "source '$COMMON'; resolve_loki_url" 2>/dev/null)" && rc=0 || rc=$?
+assert_fail "missing LOKI_URL returns error" "$rc"
 
 echo "--- Chunk size resolution ---"
 
-result="$(bash -c "source '$COMMON'; resolve_chunk_seconds dev")"
-assert_eq "dev chunk is 21600s (6h)" "21600" "$result"
+result="$(LOKI_CHUNK_SECONDS=900 bash -c "source '$COMMON'; resolve_chunk_seconds")"
+assert_eq "chunk seconds come from env" "900" "$result"
 
-result="$(bash -c "source '$COMMON'; resolve_chunk_seconds rc")"
-assert_eq "rc chunk is 3600s (1h)" "3600" "$result"
-
-result="$(bash -c "source '$COMMON'; resolve_chunk_seconds prod")"
-assert_eq "prod chunk is 300s (5m)" "300" "$result"
-
-result="$(bash -c "source '$COMMON'; resolve_chunk_seconds custom")"
-assert_eq "custom chunk defaults to 3600s (1h)" "3600" "$result"
+result="$(bash -c "source '$COMMON'; resolve_chunk_seconds")"
+assert_eq "chunk seconds default to 3600s" "3600" "$result"
 
 echo "--- Chunk labels ---"
 
-result="$(bash -c "source '$COMMON'; resolve_chunk_label dev")"
-assert_eq "dev chunk label is 6h" "6h" "$result"
+result="$(LOKI_CHUNK_LABEL=6h bash -c "source '$COMMON'; resolve_chunk_label")"
+assert_eq "chunk label comes from env" "6h" "$result"
 
-result="$(bash -c "source '$COMMON'; resolve_chunk_label rc")"
-assert_eq "rc chunk label is 1h" "1h" "$result"
-
-result="$(bash -c "source '$COMMON'; resolve_chunk_label prod")"
-assert_eq "prod chunk label is 5m" "5m" "$result"
+result="$(LOKI_CHUNK_SECONDS=3600 bash -c "source '$COMMON'; resolve_chunk_label")"
+assert_eq "chunk label can be inferred" "1h" "$result"
 
 echo "--- Config resolution (with env var) ---"
 
-result="$(LOKI_ENV=rc bash -c "source '$COMMON'; resolve_config '' ''; echo \$RESOLVED_URL")"
-assert_eq "LOKI_ENV=rc resolves URL" "https://loki-rc.example.invalid" "$result"
+result="$(LOKI_URL=https://env-loki.example.test bash -c "source '$COMMON'; resolve_config ''; echo \$RESOLVED_URL:\$RESOLVED_CHUNK_SECONDS")"
+assert_eq "resolve_config uses LOKI_URL" "https://env-loki.example.test:3600" "$result"
 
-result="$(LOKI_ENV=rc LOKI_URL_RC=https://rc-loki.example.test bash -c "source '$COMMON'; resolve_config '' ''; echo \$RESOLVED_URL")"
-assert_eq "LOKI_URL_RC overrides default RC URL" "https://rc-loki.example.test" "$result"
+result="$(LOKI_URL=https://env-loki.example.test bash -c "source '$COMMON'; resolve_config 'https://flag-loki.example.test'; echo \$RESOLVED_URL")"
+assert_eq "--url overrides LOKI_URL" "https://flag-loki.example.test" "$result"
 
-result="$(LOKI_URL=https://custom:3100 bash -c "source '$COMMON'; resolve_config '' ''; echo \$RESOLVED_URL")"
-assert_eq "LOKI_URL overrides env" "https://custom:3100" "$result"
+echo "--- Runtime does not auto-read .env ---"
 
-# Flag overrides env var
-result="$(LOKI_ENV=prod bash -c "source '$COMMON'; resolve_config 'dev' ''; echo \$RESOLVED_URL")"
-assert_eq "flag --env overrides LOKI_ENV" "https://loki-dev.example.invalid" "$result"
+ENV_FILE="/Users/Dmytro/Projects/vinitu/logcli-skill/.env"
+ENV_BACKUP=""
+if [[ -f "$ENV_FILE" ]]; then
+  ENV_BACKUP="$(mktemp)"
+  cp "$ENV_FILE" "$ENV_BACKUP"
+fi
+
+cleanup_env_file() {
+  if [[ -n "$ENV_BACKUP" && -f "$ENV_BACKUP" ]]; then
+    mv "$ENV_BACKUP" "$ENV_FILE"
+  else
+    rm -f "$ENV_FILE"
+  fi
+}
+
+trap 'cleanup_env_file; rm -rf "$tmp_dir"' EXIT
+
+cat > "$ENV_FILE" <<'EOF'
+LOKI_URL=https://stage-loki.example.test
+LOKI_CHUNK_SECONDS=120
+EOF
+
+output="$(bash -c "source '$COMMON'; resolve_config ''" 2>&1)" && rc=0 || rc=$?
+assert_fail "runtime ignores bare .env file" "$rc"
+assert_eq "error asks for exported LOKI_URL" '{"success":false,"error":"missing exported LOKI_URL. Pass LOKI_URL with the command or use --url."}' "$output"
+
+echo "--- logcli backend labels ---"
+
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+cat > "$tmp_dir/logcli" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$tmp_dir/logcli"
+result="$(PATH="$tmp_dir:/usr/bin:/bin" "$BASH_BIN" -c "source '$COMMON'; resolve_logcli_backend; logcli_backend_label")"
+assert_eq "local backend label is stable" "local" "$result"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

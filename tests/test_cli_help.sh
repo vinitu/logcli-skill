@@ -5,6 +5,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLI="$SCRIPT_DIR/../scripts/logcli.sh"
+QUERY_CMD="$SCRIPT_DIR/../scripts/commands/logs/query.sh"
+LABELS_CMD="$SCRIPT_DIR/../scripts/commands/logs/labels.sh"
+LABEL_VALUES_CMD="$SCRIPT_DIR/../scripts/commands/logs/label-values.sh"
+SERIES_CMD="$SCRIPT_DIR/../scripts/commands/logs/series.sh"
 PASS=0
 FAIL=0
 
@@ -51,32 +55,45 @@ output="$(bash "$CLI" 2>&1)" && rc=0 || rc=$?
 assert_exit_code "no args exits 0" 0 "$rc"
 assert_contains "shows usage" "$output" "Usage"
 
-# Test: query --help
-echo "--- query --help ---"
-output="$(bash "$CLI" query --help 2>&1)" && rc=0 || rc=$?
-assert_exit_code "query --help exits 0" 0 "$rc"
+# Test: public query --help
+echo "--- scripts/commands/logs/query.sh --help ---"
+output="$(bash "$QUERY_CMD" --help 2>&1)" && rc=0 || rc=$?
+assert_exit_code "query wrapper --help exits 0" 0 "$rc"
 assert_contains "shows --since flag" "$output" "--since"
 assert_contains "shows --from flag" "$output" "--from"
 assert_contains "shows --to flag" "$output" "--to"
 assert_contains "shows --limit flag" "$output" "--limit"
 
-# Test: labels --help
-echo "--- labels --help ---"
-output="$(bash "$CLI" labels --help 2>&1)" && rc=0 || rc=$?
-assert_exit_code "labels --help exits 0" 0 "$rc"
+# Test: public labels --help
+echo "--- scripts/commands/logs/labels.sh --help ---"
+output="$(bash "$LABELS_CMD" --help 2>&1)" && rc=0 || rc=$?
+assert_exit_code "labels wrapper --help exits 0" 0 "$rc"
 assert_contains "shows --since flag" "$output" "--since"
+assert_contains "shows --url flag" "$output" "--url"
 
-# Test: label-values --help
-echo "--- label-values --help ---"
-output="$(bash "$CLI" label-values --help 2>&1)" && rc=0 || rc=$?
-assert_exit_code "label-values --help exits 0" 0 "$rc"
+# Test: public label-values --help
+echo "--- scripts/commands/logs/label-values.sh --help ---"
+output="$(bash "$LABEL_VALUES_CMD" --help 2>&1)" && rc=0 || rc=$?
+assert_exit_code "label-values wrapper --help exits 0" 0 "$rc"
 assert_contains "shows label name arg" "$output" "LABEL_NAME"
 
-# Test: series --help
-echo "--- series --help ---"
-output="$(bash "$CLI" series --help 2>&1)" && rc=0 || rc=$?
-assert_exit_code "series --help exits 0" 0 "$rc"
+# Test: public series --help
+echo "--- scripts/commands/logs/series.sh --help ---"
+output="$(bash "$SERIES_CMD" --help 2>&1)" && rc=0 || rc=$?
+assert_exit_code "series wrapper --help exits 0" 0 "$rc"
 assert_contains "shows selector arg" "$output" "SELECTOR"
+
+# Test: legacy dispatch still works
+echo "--- legacy query dispatch --help ---"
+output="$(bash "$CLI" query --help 2>&1)" && rc=0 || rc=$?
+assert_exit_code "legacy query --help exits 0" 0 "$rc"
+assert_contains "legacy query dispatch shows public path" "$output" "scripts/commands/logs/query.sh"
+
+# Test: removed --env flag
+echo "--- removed --env flag ---"
+output="$(bash "$CLI" --env prod query '{job=\"app\"}' 2>&1)" && rc=0 || rc=$?
+assert_exit_code "legacy --env exits 1" 1 "$rc"
+assert_contains "legacy --env reports unknown flag" "$output" "unknown global flag"
 
 # Test: unknown command
 echo "--- unknown command ---"

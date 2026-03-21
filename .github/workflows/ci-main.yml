@@ -1,4 +1,4 @@
-name: CI · Main Push · Patch Release
+name: Main Validation and Release
 
 on:
   push:
@@ -29,7 +29,12 @@ jobs:
             LICENSE
             README.md
             SKILL.md
+            .env.example
             scripts/logcli.sh
+            scripts/commands/logs/query.sh
+            scripts/commands/logs/labels.sh
+            scripts/commands/logs/label-values.sh
+            scripts/commands/logs/series.sh
             scripts/_lib/common.sh
             references/logql-cheatsheet.md
           )
@@ -47,10 +52,17 @@ jobs:
 
       - name: Shellcheck scripts
         run: |
-          shellcheck scripts/logcli.sh scripts/_lib/common.sh
+          find scripts tests -type f -name '*.sh' -print0 | xargs -0 shellcheck -x
 
       - name: Smoke-check help output
         run: bash scripts/logcli.sh --help >/dev/null
+
+      - name: Smoke-check public commands
+        run: |
+          bash scripts/commands/logs/query.sh --help >/dev/null
+          bash scripts/commands/logs/labels.sh --help >/dev/null
+          bash scripts/commands/logs/label-values.sh --help >/dev/null
+          bash scripts/commands/logs/series.sh --help >/dev/null
 
       - name: Run unit tests
         run: |

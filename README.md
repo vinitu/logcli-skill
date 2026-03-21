@@ -1,8 +1,8 @@
 # logcli-skill
 
-AI agent skill for querying Grafana Loki logs via the `grafana/logcli` Docker image.
+AI agent skill for querying Grafana Loki logs.
 
-Wraps `grafana/logcli` with environment resolution, auto-chunking for large time ranges, and JSON error reporting.
+Wraps `logcli` with environment resolution, auto-chunking for large time ranges, and JSON error reporting. The skill prefers a local `logcli` binary and falls back to the `grafana/logcli` Docker image when the binary is missing.
 
 ## Installation
 
@@ -10,52 +10,71 @@ Wraps `grafana/logcli` with environment resolution, auto-chunking for large time
 npx skills add vinitu/logcli-skill
 ```
 
-Installs to: `~/.agents/skills/logcli/`
+Upstream package source: `vinitu/logcli-skill`
+Installed global skill directory: `~/.agents/skills/logcli/`
 
-**Note:** The GitHub repository is `logcli-skill`, but the installed skill directory is `logcli`.
+Name mapping:
+
+- Repository: `logcli-skill`
+- Package source: `vinitu/logcli-skill`
+- Installed directory: `logcli`
 
 ## Prerequisites
 
-- **Docker** — all Loki queries run inside `docker run grafana/logcli:latest`
 - **bash 4.0+** — `brew install bash` on macOS (macOS ships bash 3.2)
 - **jq** — optional, for JSON array formatting in `labels`/`label-values`/`series`
 - **shellcheck** — for development only (`make compile`)
 
-Pull the Docker image before first use:
-
-```bash
-docker pull grafana/logcli:latest
-```
+Runtime selection is automatic: the shell wrappers prefer local `logcli` and fall back to `grafana/logcli:latest` in Docker.
 
 ## Setup
 
 ```bash
 cp .env.example .env
-# Edit .env — set LOKI_ENV to dev, rc, or prod
-# Optional: set LOKI_URL_DEV / LOKI_URL_RC / LOKI_URL_PROD with real endpoints
-# Optional: set LOKI_URL to bypass env mapping for one direct endpoint
+# Edit .env if you want a local template with LOKI_URL
+# Optional: set LOGCLI_BIN to a specific local logcli path
+# Optional: set LOGCLI_IMAGE to override the Docker fallback image
+# Optional: add LOKI_CHUNK_SECONDS or LOKI_CHUNK_LABEL
 ```
 
-## Usage
+For agent usage, pass the needed Loki env vars directly with the command:
+
+```bash
+LOKI_URL=https://loki.example.com scripts/commands/logs/labels.sh --since 1h
+LOKI_URL=https://loki.example.com scripts/commands/logs/query.sh '{job="app"}' --since 30m
+```
+
+## Public Interface
+
+Run public commands from the repo root:
+
+- `scripts/commands/logs/query.sh`
+- `scripts/commands/logs/labels.sh`
+- `scripts/commands/logs/label-values.sh`
+- `scripts/commands/logs/series.sh`
+
+`scripts/logcli.sh` still exists as a compatibility wrapper for older automation, but the public interface is `scripts/commands/logs/*.sh`.
+
+## Examples
 
 ```bash
 # Query logs
-scripts/logcli.sh query '{job="app"}' --since 1h
+LOKI_URL=https://loki.example.com scripts/commands/logs/query.sh '{job="app"}' --since 1h
 
-# Query with environment override
-scripts/logcli.sh query '{job="app"}' --since 30m --env prod
+# Query with explicit URL override
+scripts/commands/logs/query.sh '{job="app"}' --since 30m --url https://loki.example.com
 
 # List available labels
-scripts/logcli.sh labels --since 1h
+LOKI_URL=https://loki.example.com scripts/commands/logs/labels.sh --since 1h
 
 # List values for a label
-scripts/logcli.sh label-values job --since 1h
+LOKI_URL=https://loki.example.com scripts/commands/logs/label-values.sh job --since 1h
 
 # List log series
-scripts/logcli.sh series '{job="app"}' --since 1h
+LOKI_URL=https://loki.example.com scripts/commands/logs/series.sh '{job="app"}' --since 1h
 
 # Use a custom Loki URL
-scripts/logcli.sh labels --url https://my-loki:3100 --since 1h
+scripts/commands/logs/labels.sh --url https://my-loki:3100 --since 1h
 ```
 
 ## Repo Layout
@@ -68,14 +87,25 @@ logcli-skill/
 ├── Makefile                   # Validation targets
 ├── LICENSE                    # MIT
 ├── .env.example               # Config template
+├── .github/
+│   └── workflows/
+│       ├── ci-pr.yml          # PR validation and auto-merge flow
+│       └── ci-main.yml        # Main-branch validation and release flow
 ├── scripts/
-│   ├── logcli.sh              # CLI entrypoint
+│   ├── commands/
+│   │   └── logs/              # Public command surface
+│   │       ├── query.sh
+│   │       ├── labels.sh
+│   │       ├── label-values.sh
+│   │       └── series.sh
+│   ├── logcli.sh              # Compatibility wrapper
 │   └── _lib/
-│       └── common.sh          # Shared helpers
+│       └── common.sh          # Internal shared helpers
 ├── references/
 │   └── logql-cheatsheet.md    # LogQL syntax reference
 └── tests/
-    ├── test_cli_help.sh       # Help output validation
+    ├── test_cli_help.sh       # Help and dispatch validation
+    ├── test_backend_resolution.sh # Local-vs-Docker backend tests
     ├── test_env_resolution.sh # Environment config tests
     ├── test_chunking.sh       # Time range chunking tests
     └── test_json_output.sh    # JSON contract tests
@@ -90,22 +120,46 @@ make test       # Run unit tests (no Docker needed)
 make test-live  # Run live tests (requires Docker + network)
 ```
 
-## Environments
+CI workflows:
 
-| Environment | Loki URL | Max Query Window |
-|-------------|----------|-----------------|
-| dev (default) | `https://loki-dev.example.invalid` | 6h |
-| rc | `https://loki-rc.example.invalid` | 1h |
-| prod | `https://loki-prod.example.invalid` | 5m |
+- `.github/workflows/ci-pr.yml` validates pull requests and controls auto-merge.
+- `.github/workflows/ci-main.yml` validates `main` and creates releases.
 
-These are safe placeholder defaults. Set real endpoints in `.env` or shell env vars.
+## Environment Setup
+
+Loki URL comes from the passed `LOKI_URL` env var. The skill does not keep environment names or URL maps.
+`.env` is only a local convenience file. The shell wrappers do not read it by themselves.
+
+Example values:
+
+```bash
+LOKI_URL=https://loki.example.com
+LOKI_CHUNK_SECONDS=3600
+```
+
+You can also skip `LOKI_URL` and use `--url` directly.
+
+## Output Contract
+
+- `query.sh` streams log lines to stdout and writes a JSON status envelope to stderr.
+- `labels.sh`, `label-values.sh`, and `series.sh` return JSON to stdout.
+- Success envelopes include `backend`, which is `local` or `docker:<image>`.
+- All failures return JSON to stderr with non-zero exit status.
 
 ## Known Limits
 
-- Requires Docker for all Loki operations — no native HTTP client.
+- Prefers local `logcli`. Docker is only a fallback runtime.
 - Requires bash 4.0+ for associative arrays (macOS default is 3.2).
-- Chunk limits are per-environment; the script auto-splits but does not merge partial results.
-- The `query` command outputs logs to stdout and status to stderr (for piping compatibility).
+- Chunk limits come from `LOKI_CHUNK_SECONDS`; otherwise the skill uses a 1h fallback.
+- `query.sh` outputs logs to stdout and status to stderr for piping compatibility.
+- The repo has no `scripts/applescripts/` directory because this is not a macOS app skill.
+- All tests live in top-level `tests/`.
+
+## Unsupported Behaviour
+
+- No write or admin operation exists.
+- No fallback exists after both local `logcli` and Docker are unavailable.
+- No result caching or local log storage exists.
 
 ## License
 

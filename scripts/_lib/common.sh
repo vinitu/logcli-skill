@@ -14,55 +14,28 @@ fi
 
 COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$COMMON_DIR/../.." && pwd)"
+PUBLIC_COMMANDS_DIR="$ROOT_DIR/scripts/commands/logs"
 
-# --- Environment mapping ---
-
-declare -A LOKI_URLS=(
-  [dev]="https://loki-dev.example.invalid"
-  [rc]="https://loki-rc.example.invalid"
-  [prod]="https://loki-prod.example.invalid"
-)
-
-declare -A LOKI_CHUNK_SECONDS=(
-  [dev]=21600   # 6h
-  [rc]=3600     # 1h
-  [prod]=300    # 5m
-)
-
-declare -A LOKI_CHUNK_LABELS=(
-  [dev]="6h"
-  [rc]="1h"
-  [prod]="5m"
-)
-
-DEFAULT_ENV="dev"
 DEFAULT_LIMIT=5000
 DEFAULT_OUTPUT="jsonl"
 DEFAULT_CHUNK_SECONDS=3600  # 1h fallback for custom URLs
-
-# --- .env loader ---
-
-load_dotenv() {
-  local env_file="${ROOT_DIR}/.env"
-  if [[ -f "$env_file" ]]; then
-    while IFS='=' read -r key value; do
-      # Skip comments and empty lines
-      [[ "$key" =~ ^[[:space:]]*# ]] && continue
-      [[ -z "$key" ]] && continue
-      key="$(echo "$key" | xargs)"
-      value="$(echo "$value" | xargs)"
-      # Only set if not already in environment
-      if [[ -z "${!key:-}" ]]; then
-        export "$key=$value"
-      fi
-    done < "$env_file"
-  fi
-}
+DEFAULT_LOGCLI_IMAGE="grafana/logcli:latest"
 
 # --- JSON helpers ---
 
+json_escape() {
+  local value="${1-}"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  printf '%s' "$value"
+}
+
 json_fail() {
-  local message="$1"
+  local message
+  message="$(json_escape "$1")"
   printf '{"success":false,"error":"%s"}\n' "$message" >&2
   return 1
 }
@@ -76,6 +49,32 @@ json_status() {
   # Print status envelope to stderr for query command
   local payload="$1"
   printf '{"success":true,%s}\n' "$payload" >&2
+}
+
+json_array_from_lines() {
+  local input="${1-}"
+
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$input" | jq -R -s 'split("\n") | map(select(length > 0))'
+    return 0
+  fi
+
+  local json_array="["
+  local first=true
+  local line
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if [[ "$first" == "true" ]]; then
+      first=false
+    else
+      json_array+=","
+    fi
+    json_array+="\"$(json_escape "$line")\""
+  done <<< "$input"
+
+  json_array+="]"
+  printf '%s\n' "$json_array"
 }
 
 # --- Duration parsing ---
@@ -199,72 +198,164 @@ generate_chunk_boundaries() {
   done
 }
 
-# --- Environment resolution ---
+# --- Configuration resolution ---
 
-# Resolve environment name to Loki URL
-# Usage: resolve_env <env_name>
 resolve_loki_url() {
-  local env_name="$1"
-  local env_var_name="LOKI_URL_${env_name^^}"
-  local env_var_url="${!env_var_name:-}"
-  local url="${env_var_url:-${LOKI_URLS[$env_name]:-}}"
-  if [[ -z "$url" ]]; then
+  if [[ -n "${LOKI_URL:-}" ]]; then
+    printf '%s\n' "$LOKI_URL"
+    return 0
+  fi
+
+  return 1
+}
+
+resolve_chunk_seconds() {
+  printf '%s\n' "${LOKI_CHUNK_SECONDS:-$DEFAULT_CHUNK_SECONDS}"
+}
+
+resolve_chunk_label() {
+  if [[ -n "${LOKI_CHUNK_LABEL:-}" ]]; then
+    printf '%s\n' "$LOKI_CHUNK_LABEL"
+    return 0
+  fi
+
+  local seconds
+  seconds="$(resolve_chunk_seconds)"
+  case "$seconds" in
+    *[!0-9]*|'')
+      printf '1h\n'
+      ;;
+    60)
+      printf '1m\n'
+      ;;
+    300)
+      printf '5m\n'
+      ;;
+    600)
+      printf '10m\n'
+      ;;
+    1800)
+      printf '30m\n'
+      ;;
+    3600)
+      printf '1h\n'
+      ;;
+    7200)
+      printf '2h\n'
+      ;;
+    21600)
+      printf '6h\n'
+      ;;
+    86400)
+      printf '24h\n'
+      ;;
+    *)
+      printf '%ss\n' "$seconds"
+      ;;
+  esac
+}
+
+# --- logcli backend resolution ---
+
+resolve_logcli_binary() {
+  if [[ -n "${LOGCLI_BIN:-}" ]]; then
+    if [[ -x "${LOGCLI_BIN}" ]]; then
+      printf '%s\n' "${LOGCLI_BIN}"
+      return 0
+    fi
     return 1
   fi
-  echo "$url"
+
+  command -v logcli 2>/dev/null || return 1
 }
 
-# Get chunk size in seconds for an environment
-resolve_chunk_seconds() {
-  local env_name="$1"
-  echo "${LOKI_CHUNK_SECONDS[$env_name]:-$DEFAULT_CHUNK_SECONDS}"
+resolve_logcli_image() {
+  printf '%s\n' "${LOGCLI_IMAGE:-$DEFAULT_LOGCLI_IMAGE}"
 }
 
-# Get chunk size label for an environment
-resolve_chunk_label() {
-  local env_name="$1"
-  echo "${LOKI_CHUNK_LABELS[$env_name]:-1h}"
+resolve_logcli_backend() {
+  local local_binary=""
+  if local_binary="$(resolve_logcli_binary)"; then
+    RESOLVED_LOGCLI_BACKEND="local"
+    RESOLVED_LOGCLI_BIN="$local_binary"
+    RESOLVED_LOGCLI_IMAGE=""
+    return 0
+  fi
+
+  if command -v docker >/dev/null 2>&1; then
+    RESOLVED_LOGCLI_BACKEND="docker"
+    RESOLVED_LOGCLI_BIN=""
+    RESOLVED_LOGCLI_IMAGE="$(resolve_logcli_image)"
+    return 0
+  fi
+
+  RESOLVED_LOGCLI_BACKEND=""
+  RESOLVED_LOGCLI_BIN=""
+  RESOLVED_LOGCLI_IMAGE=""
+  return 1
 }
 
-# --- Docker wrapper ---
+ensure_logcli_backend() {
+  if resolve_logcli_backend; then
+    return 0
+  fi
 
-# Run logcli via Docker
+  if [[ -n "${LOGCLI_BIN:-}" ]]; then
+    json_fail "LOGCLI_BIN is set but not executable: ${LOGCLI_BIN}"
+    return 1
+  fi
+
+  json_fail "logcli not found in PATH and docker not found. Install local logcli or Docker to use this skill."
+  return 1
+}
+
+# Usage: logcli_backend_label
+logcli_backend_label() {
+  case "${RESOLVED_LOGCLI_BACKEND:-}" in
+    local)
+      printf 'local\n'
+      ;;
+    docker)
+      printf 'docker:%s\n' "$(json_escape "${RESOLVED_LOGCLI_IMAGE:-$DEFAULT_LOGCLI_IMAGE}")"
+      ;;
+    *)
+      printf 'unknown\n'
+      ;;
+  esac
+}
+
+# Run logcli via the resolved backend.
 # Usage: run_logcli <loki_url> <subcommand> [args...]
 run_logcli() {
   local loki_url="$1"
   shift
-  docker run --rm -e LOKI_ADDR="$loki_url" grafana/logcli:latest "$@"
+
+  case "${RESOLVED_LOGCLI_BACKEND:-}" in
+    local)
+      LOKI_ADDR="$loki_url" "$RESOLVED_LOGCLI_BIN" "$@"
+      ;;
+    docker)
+      docker run --rm -e LOKI_ADDR="$loki_url" "$RESOLVED_LOGCLI_IMAGE" "$@"
+      ;;
+    *)
+      json_fail "logcli backend is not resolved"
+      return 1
+      ;;
+  esac
 }
 
-# --- Config resolution ---
-
-# Resolve final config from flags, env vars, and .env
-# Sets global variables: RESOLVED_URL, RESOLVED_ENV, RESOLVED_CHUNK_SECONDS
 resolve_config() {
-  local flag_env="${1:-}"
-  local flag_url="${2:-}"
+  local flag_url="${1:-}"
+  local url="${flag_url:-}"
 
-  # Load .env (only sets vars not already in environment)
-  load_dotenv
-
-  # Determine environment
-  local env_name="${flag_env:-${LOKI_ENV:-$DEFAULT_ENV}}"
-
-  # Determine URL
-  local url="${flag_url:-${LOKI_URL:-}}"
-
-  if [[ -n "$url" ]]; then
-    # Direct URL provided — use it
-    RESOLVED_URL="$url"
-    RESOLVED_ENV="${env_name}"
-    RESOLVED_CHUNK_SECONDS="$(resolve_chunk_seconds "$env_name")"
-  else
-    # Resolve from environment name
-    RESOLVED_URL="$(resolve_loki_url "$env_name")" || {
-      json_fail "unknown environment: ${env_name}. Valid: dev, rc, prod (or use --url)"
+  if [[ -z "$url" ]]; then
+    RESOLVED_URL="$(resolve_loki_url)" || {
+      json_fail "missing exported LOKI_URL. Pass LOKI_URL with the command or use --url."
       return 1
     }
-    RESOLVED_ENV="$env_name"
-    RESOLVED_CHUNK_SECONDS="$(resolve_chunk_seconds "$env_name")"
+  else
+    RESOLVED_URL="$url"
   fi
+
+  RESOLVED_CHUNK_SECONDS="$(resolve_chunk_seconds)"
 }

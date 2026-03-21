@@ -5,7 +5,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLI="$SCRIPT_DIR/../scripts/logcli.sh"
+QUERY_CMD="$SCRIPT_DIR/../scripts/commands/logs/query.sh"
+LABEL_VALUES_CMD="$SCRIPT_DIR/../scripts/commands/logs/label-values.sh"
+SERIES_CMD="$SCRIPT_DIR/../scripts/commands/logs/series.sh"
 COMMON="$SCRIPT_DIR/../scripts/_lib/common.sh"
+BASH_BIN="$(command -v bash)"
 PASS=0
 FAIL=0
 
@@ -57,7 +61,7 @@ assert_valid_json() {
 echo "=== test_json_output.sh ==="
 
 echo "--- Error output: missing query ---"
-output="$(bash "$CLI" query 2>&1)" || true
+output="$(bash "$QUERY_CMD" 2>&1)" || true
 # Filter to just the JSON line (skip usage text)
 json_line="$(echo "$output" | grep '"success"' | tail -1)"
 assert_valid_json "missing query produces valid JSON" "$json_line"
@@ -70,22 +74,22 @@ assert_valid_json "unknown command produces valid JSON" "$output"
 assert_json_field "success is false" "$output" '.success' "false"
 
 echo "--- Error output: missing label name ---"
-output="$(bash "$CLI" label-values 2>&1)" || true
+output="$(bash "$LABEL_VALUES_CMD" 2>&1)" || true
 # Filter to just the JSON line (skip usage text)
 json_line="$(echo "$output" | grep '"success"' | tail -1)"
 assert_valid_json "missing label produces valid JSON" "$json_line"
 assert_json_field "success is false" "$json_line" '.success' "false"
 
 echo "--- Error output: missing series selector ---"
-output="$(bash "$CLI" series 2>&1)" || true
+output="$(bash "$SERIES_CMD" 2>&1)" || true
 json_line="$(echo "$output" | grep '"success"' | tail -1)"
 assert_valid_json "missing selector produces valid JSON" "$json_line"
 assert_json_field "success is false" "$json_line" '.success' "false"
 
-echo "--- Error output: unknown env ---"
-output="$(LOKI_ENV=nonexistent bash "$CLI" query '{job="x"}' 2>&1)" || true
+echo "--- Error output: missing LOKI_URL ---"
+output="$(bash "$QUERY_CMD" '{job="x"}' 2>&1)" || true
 json_line="$(echo "$output" | grep '"success"' | tail -1)"
-assert_valid_json "unknown env produces valid JSON" "$json_line"
+assert_valid_json "missing LOKI_URL produces valid JSON" "$json_line"
 assert_json_field "success is false" "$json_line" '.success' "false"
 
 echo "--- JSON helpers: json_fail ---"
@@ -99,6 +103,18 @@ output="$(bash -c "source '$COMMON'; json_ok '\"test\":\"value\"'")"
 assert_valid_json "json_ok is valid JSON" "$output"
 assert_json_field "json_ok success is true" "$output" '.success' "true"
 assert_json_field "json_ok has payload" "$output" '.test' "value"
+
+echo "--- Backend label output ---"
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+cat > "$tmp_dir/logcli" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$tmp_dir/logcli"
+output="$(COMMON_PATH="$COMMON" PATH="$tmp_dir:/usr/bin:/bin" "$BASH_BIN" -c "source \"\$COMMON_PATH\"; resolve_logcli_backend; backend=\"\$(logcli_backend_label)\"; json_ok \"\\\"backend\\\":\\\"\${backend}\\\"\"")"
+assert_valid_json "backend label payload is valid JSON" "$output"
+assert_json_field "backend label is local" "$output" '.backend' "local"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
